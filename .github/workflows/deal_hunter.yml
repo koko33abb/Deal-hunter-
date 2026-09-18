@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'وضع التشغيل'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - test
 
 jobs:
   hunt:
@@ -24,4 +33,4 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python deal_hunter.py
+        run: python deal_hunter.py ${{ github.event.inputs.mode || 'normal' }}
