@@ -30,6 +30,9 @@ import google.generativeai as genai  # noqa: E402
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
+# رقم محادثتك مع البوت (ليس سراً: لا يُستخدم دون توكن البوت)
+DEFAULT_TELEGRAM_CHAT_ID = "8035757986"
+
 CRAIGSLIST_CITY = "losangeles"
 SEARCH_TERMS = ["gaming pc", "computer parts", "gpu"]
 
@@ -89,7 +92,7 @@ PRICE_TABLE = {
 
 def get_chat_id():
     """يجلب رقم المحادثة. يتطلب أن يكون المستخدم قد أرسل /start للبوت."""
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or DEFAULT_TELEGRAM_CHAT_ID
     if chat_id:
         return chat_id
 
