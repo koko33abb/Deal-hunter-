@@ -39,8 +39,14 @@ SHIPPING_COST = 25          # تكلفة شحن تقديرية بالدولار
 MAX_ITEMS_PER_SEARCH = 40   # أقصى عدد إعلانات يُفحص لكل كلمة بحث
 MAX_ALERTS_PER_RUN = 5      # أقصى عدد تنبيهات في التشغيل الواحد
 
-# النماذج تُجرَّب بالترتيب حتى ينجح أحدها
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+# النماذج تُجرَّب بالترتيب حتى ينجح أحدها (ثم تُكتشف نماذج أخرى تلقائياً)
+GEMINI_MODELS = ["gemini-3.6-flash"]
+
+# كلمات بحث وضع الاختبار: نبحث عن كروت شاشة حقيقية بدل الكابلات والإكسسوارات
+TEST_SEARCH_TERMS = ["rtx 3070", "rtx 3080", "rtx 4070", "rtx 3060"]
+
+# أسباب فشل Gemini تُحفظ هنا ليُرسَل ملخصها لتيليجرام
+GEMINI_ERRORS = []
 
 HEADERS = {
     "User-Agent": (
@@ -165,17 +171,44 @@ def send_telegram_photo(image_url, caption):
 # تحليل الصور (Gemini Vision)
 # ============================================================
 
+def record_gemini_error(message):
+    """يحفظ سبب الفشل بعد إخفاء مفتاح Gemini إن ظهر فيه."""
+    text = str(message)
+    if GEMINI_API_KEY:
+        text = text.replace(GEMINI_API_KEY, "***")
+    text = text.replace("\n", " ")[:300]
+    print("سبب الفشل:", text)
+    GEMINI_ERRORS.append(text)
+
+
+def discover_gemini_models():
+    """يسأل Gemini عن النماذج المتاحة لهذا المفتاح، ويعيد أسماء نماذج flash."""
+    names = []
+    try:
+        for model in genai.list_models():
+            methods = model.supported_generation_methods or []
+            name = model.name.replace("models/", "")
+            if "generateContent" not in methods or "flash" not in name:
+                continue
+            if any(word in name for word in ["image", "tts", "live", "audio"]):
+                continue
+            names.append(name)
+    except Exception as error:
+        record_gemini_error("تعذر جلب قائمة النماذج: " + str(error))
+    return names[:5]
+
+
 def analyze_image_full_report(image_url):
     """يحلل صورة الإعلان ويعيد تقريراً منظماً، أو None عند الفشل."""
     if not GEMINI_API_KEY:
-        print("مفتاح GEMINI_API_KEY غير موجود.")
+        record_gemini_error("مفتاح GEMINI_API_KEY غير موجود في GitHub Secrets")
         return None
 
     try:
         image_response = requests.get(image_url, headers=HEADERS, timeout=30)
         image_response.raise_for_status()
     except Exception as error:
-        print("تعذر تحميل الصورة للتحليل:", error)
+        record_gemini_error("تعذر تحميل الصورة للتحليل: " + str(error))
         return None
 
     mime_type = image_response.headers.get("Content-Type", "image/jpeg")
@@ -195,19 +228,37 @@ def analyze_image_full_report(image_url):
     )
 
     genai.configure(api_key=GEMINI_API_KEY)
-    for model_name in GEMINI_MODELS:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(
-                [prompt, {"mime_type": mime_type, "data": image_response.content}]
-            )
-            text = (response.text or "").strip()
-            if text:
-                print("نجح تحليل الصورة بالنموذج:", model_name)
-                return text
-        except Exception as error:
-            print("فشل النموذج", model_name, ":", error)
+    model_names = list(GEMINI_MODELS)
+    tried_first_round = False
+    while True:
+        for model_name in model_names:
+            result = try_gemini_model(model_name, prompt, mime_type, image_response.content)
+            if result:
+                return result
+        if tried_first_round:
+            return None
+        tried_first_round = True
+        extra = [name for name in discover_gemini_models() if name not in model_names]
+        print("نماذج إضافية مكتشفة:", extra)
+        if not extra:
+            return None
+        model_names = extra
 
+
+def try_gemini_model(model_name, prompt, mime_type, image_bytes):
+    """يجرب نموذجاً واحداً ويعيد النص أو None."""
+    try:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(
+            [prompt, {"mime_type": mime_type, "data": image_bytes}]
+        )
+        text = (response.text or "").strip()
+        if text:
+            print("نجح تحليل الصورة بالنموذج:", model_name)
+            return text
+        record_gemini_error(model_name + ": رد فارغ")
+    except Exception as error:
+        record_gemini_error(model_name + ": " + str(error))
     return None
 
 
@@ -367,6 +418,28 @@ def main():
 # وضع الاختبار
 # ============================================================
 
+def find_test_listing():
+    """يختار إعلاناً للاختبار: يفضّل كرت شاشة معروفاً، ثم أي إعلان بصورة."""
+    # الجولة الأولى: إعلانات يعرفها جدول الأسعار (كروت شاشة)
+    for term in TEST_SEARCH_TERMS:
+        for listing in search_listings(term)[:15]:
+            key, _ = estimate_market_value(listing["title"])
+            if not key:
+                continue
+            image_url = get_listing_image(listing["link"])
+            if image_url:
+                return listing, image_url
+
+    # الجولة الثانية: أي إعلان له صورة
+    for term in SEARCH_TERMS:
+        for listing in search_listings(term)[:15]:
+            image_url = get_listing_image(listing["link"])
+            if image_url:
+                return listing, image_url
+
+    return None, None
+
+
 def run_vision_test():
     print("=== بدء اختبار الرؤية ===")
 
@@ -374,17 +447,7 @@ def run_vision_test():
         print("فشل الإرسال لتيليجرام. تأكد من إرسال /start للبوت ثم أعد التشغيل.")
         return
 
-    test_listing = None
-    test_image = None
-    for term in SEARCH_TERMS:
-        for listing in search_listings(term)[:15]:
-            image_url = get_listing_image(listing["link"])
-            if image_url:
-                test_listing = listing
-                test_image = image_url
-                break
-        if test_listing:
-            break
+    test_listing, test_image = find_test_listing()
 
     if not test_listing:
         print("لم يُعثر على إعلان بصورة.")
@@ -396,7 +459,8 @@ def run_vision_test():
 
     analysis = analyze_image_full_report(test_image)
     if not analysis:
-        send_telegram_alert("فشل تحليل الصورة عبر Gemini. راجع السجل في GitHub Actions.")
+        reasons = "\n".join(GEMINI_ERRORS[-4:]) or "سبب غير معروف"
+        send_telegram_alert("فشل تحليل الصورة عبر Gemini.\n\nالأسباب:\n" + reasons)
         return
 
     caption = (
