@@ -1,237 +1,423 @@
+# -*- coding: utf-8 -*-
+"""
+Deal Hunter - النسخة الكاملة المرتبة
+
+طريقة التشغيل:
+    python deal_hunter.py          -> التشغيل العادي (البحث عن صفقات)
+    python deal_hunter.py test     -> وضع الاختبار (تحليل صورة + إرسالها لتيليجرام)
+
+المتغيرات السرية المطلوبة (GitHub Secrets):
+    TELEGRAM_BOT_TOKEN
+    GEMINI_API_KEY
+"""
+
 import os
 import re
+import sys
+import warnings
+
 import requests
-import google.generativeai as genai
 from bs4 import BeautifulSoup
 
-# ============ الإعدادات ============
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-MIN_PROFIT_THRESHOLD = 200  # الحد الأدنى للربح الصافي المقبول لكل صفقة
+warnings.filterwarnings("ignore")
+import google.generativeai as genai  # noqa: E402
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
 
-# ============ دالة إرسال تنبيه Telegram ============
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    try:
-        resp = requests.get(url, timeout=10).json()
-        chat_id = None
-        if resp.get("result"):
-            chat_id = resp["result"][-1]["message"]["chat"]["id"]
-        if not chat_id:
-            print("لم يتم العثور على chat_id بعد - أرسل أي رسالة للبوت أولاً على تيليجرام")
-            return
-        send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(send_url, data={"chat_id": chat_id, "text": message}, timeout=10)
-        print("تم إرسال التنبيه بنجاح")
-    except Exception as e:
-        print(f"خطأ في إرسال تيليجرام: {e}")
+# ============================================================
+# الإعدادات
+# ============================================================
 
-# ============ دالة تحليل صورة عبر Gemini ============
-def analyze_image_with_gemini(image_url, listing_title):
-    try:
-        img_data = requests.get(image_url, timeout=10).content
-        prompt = f"""
-        هذا إعلان بعنوان: "{listing_title}"
-        افحص هذه الصورة بدقة وحدد: هل يوجد بها أي قطعة كمبيوتر واضحة (مثل SSD, GPU, RAM, CPU)
-        لم يُذكر اسمها في العنوان؟ إذا وُجدت، اذكر اسمها المحتمل باختصار.
-        إذا لم تجد شيئاً، اكتب: لا يوجد.
-        """
-        response = model.generate_content(
-            [prompt, {"mime_type": "image/jpeg", "data": img_data}]
-        )
-        return response.text.strip()
-    except Exception as e:
-        print(f"خطأ في تحليل الصورة: {e}")
-        return "لا يوجد"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
-# ============ دالة تقدير القيمة السوقية (مبسّطة - تُطوَّر لاحقاً) ============
-def estimate_market_value(component_name):
-    price_table = {
-        "ssd": 60,
-        "rtx 3070": 280,
-        "rtx 3060": 200,
-        "gtx 1660": 130,
-        "ram": 40,
-        "cpu": 100,
-    }
-    component_name = component_name.lower()
-    for key, value in price_table.items():
-        if key in component_name:
-            return value
-    return 0
+CRAIGSLIST_CITY = "losangeles"
+SEARCH_TERMS = ["gaming pc", "computer parts", "gpu"]
 
-# ============ دالة البحث الرئيسية (Craigslist كمثال أولي) ============
-def search_listings(query, city="losangeles"):
-    url = f"https://{city}.craigslist.org/search/sss?query={query}"
-    listings = []
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.select("li.cl-search-result")[:10]
-        for item in items:
-            title_tag = item.select_one("a.cl-app-anchor")
-            price_tag = item.select_one("span.priceinfo")
-            if not title_tag or not price_tag:
-                continue
-            title = title_tag.get_text(strip=True)
-            link = title_tag.get("href")
-            price_text = re.sub(r"[^\d]", "", price_tag.get_text())
-            price = int(price_text) if price_text else 0
-            img_tag = item.select_one("img")
-            image_url = img_tag.get("src") if img_tag else None
-            listings.append({
-                "title": title,
-                "price": price,
-                "link": link,
-                "image": image_url
-            })
-    except Exception as e:
-        print(f"خطأ في البحث: {e}")
-    return listings
+MIN_PROFIT = 200            # الحد الأدنى للربح الصافي بالدولار
+SELLING_FEE_RATE = 0.13     # نسبة عمولة البيع التقديرية
+SHIPPING_COST = 25          # تكلفة شحن تقديرية بالدولار
+MAX_ITEMS_PER_SEARCH = 40   # أقصى عدد إعلانات يُفحص لكل كلمة بحث
+MAX_ALERTS_PER_RUN = 5      # أقصى عدد تنبيهات في التشغيل الواحد
 
-# ============ منطق القرار الرئيسي ============
-def process_listing(listing):
-    title = listing["title"]
-    price = listing["price"]
-    image_url = listing.get("image")
+# النماذج تُجرَّب بالترتيب حتى ينجح أحدها
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
-    detected_component = "لا يوجد"
-    if image_url:
-        detected_component = analyze_image_with_gemini(image_url, title)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-    if "لا يوجد" in detected_component:
-        return
+# جدول أسعار السوق التقريبية (بالدولار) - يمكن تعديله يدوياً لاحقاً
+PRICE_TABLE = {
+    "rtx4090": 1500,
+    "rtx4080super": 950,
+    "rtx4080": 900,
+    "rtx4070tisuper": 750,
+    "rtx4070ti": 650,
+    "rtx4070super": 550,
+    "rtx4070": 480,
+    "rtx4060ti": 350,
+    "rtx4060": 270,
+    "rtx3090ti": 750,
+    "rtx3090": 650,
+    "rtx3080ti": 450,
+    "rtx3080": 380,
+    "rtx3070ti": 280,
+    "rtx3070": 240,
+    "rtx3060ti": 200,
+    "rtx3060": 160,
+    "rx7900xtx": 800,
+    "rx7900xt": 650,
+    "rx6800xt": 300,
+    "rx6700xt": 200,
+    "ps5": 400,
+}
 
-    market_value = estimate_market_value(detected_component)
-    if market_value == 0:
-        return
 
-    estimated_profit = market_value - price
+# ============================================================
+# تيليجرام
+# ============================================================
 
-    if estimated_profit >= MIN_PROFIT_THRESHOLD:
-        message = (
-            f"🔥 صفقة محتملة!\n"
-            f"📦 العنوان: {title}\n"
-            f"🔎 مكوّن مكتشف: {detected_component}\n"
-            f"💰 سعر الإعلان: {price}$\n"
-            f"📊 القيمة السوقية التقديرية: {market_value}$\n"
-            f"✅ الربح الصافي المتوقع: {estimated_profit}$\n"
-            f"🔗 {listing['link']}"
-        )
-        send_telegram_alert(message)
-        print("تم العثور على صفقة وإرسال تنبيه")
-
-# ============ نقطة البداية ============
-def main():
-    search_terms = ["gaming pc", "computer parts", "gpu"]
-    for term in search_terms:
-        listings = search_listings(term)
-        for listing in listings:
-            process_listing(listing)
-
-# ============ جلب chat_id ============
 def get_chat_id():
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    """يجلب رقم المحادثة. يتطلب أن يكون المستخدم قد أرسل /start للبوت."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if chat_id:
+        return chat_id
+
+    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/getUpdates"
     try:
-        resp = requests.get(url, timeout=10).json()
-        if resp.get("result"):
-            return resp["result"][-1]["message"]["chat"]["id"]
-    except Exception as e:
-        print(f"خطأ في جلب chat_id: {e}")
-    return None
-
-# ============ إرسال صورة مع تعليق إلى Telegram ============
-def send_telegram_photo(image_url, caption):
-    chat_id = get_chat_id()
-    if not chat_id:
-        print("لم يتم العثور على chat_id - تأكد من إرسال رسالة للبوت أولاً")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    try:
-        resp = requests.post(url, data={
-            "chat_id": chat_id,
-            "photo": image_url,
-            "caption": caption
-        }, timeout=15)
-        print(f"نتيجة إرسال الصورة إلى Telegram: {resp.status_code}")
-        print(f"محتوى الرد: {resp.text[:300]}")
-    except Exception as e:
-        print(f"خطأ في إرسال الصورة: {e}")
-
-# ============ تحليل صورة تفصيلي (تقرير كامل) ============
-def analyze_image_full_report(image_url, listing_title):
-    print("--- بدء تحليل الصورة ---")
-    print(f"رابط الصورة المُرسل إلى Gemini: {image_url}")
-    try:
-        img_data = requests.get(image_url, timeout=10).content
-        print(f"تم تحميل الصورة بنجاح - الحجم بالبايت: {len(img_data)}")
-
-        prompt = f"""
-أنت خبير تقييم قطع كمبيوتر مستعملة من الصور.
-عنوان الإعلان: "{listing_title}"
-
-افحص الصورة بدقة، وأجب بهذا التنسيق بالضبط (سطر واحد لكل بند، بدون أي شرح إضافي):
-
-القطعة_المكتشفة: <اسم القطعة أو "لا يوجد">
-الموديل_المحتمل: <رقم/اسم الموديل أو "غير واضح">
-الحالة: <ممتازة / جيدة / متوسطة / تالفة / غير معروفة>
-علامات_التلف: <وصف مختصر أو "لا يوجد">
-درجة_الثقة: <رقم من 0 إلى 100>
-"""
-        print("جاري إرسال الصورة والطلب إلى Gemini API...")
-        response = model.generate_content(
-            [prompt, {"mime_type": "image/jpeg", "data": img_data}]
-        )
-        raw_text = response.text.strip()
-        print("--- الرد الخام الكامل من Gemini ---")
-        print(raw_text)
-        print("--- نهاية الرد ---")
-        return raw_text
-    except Exception as e:
-        print(f"خطأ أثناء تحليل الصورة: {e}")
+        response = requests.get(url, timeout=30)
+        data = response.json()
+    except Exception as error:
+        print("خطأ أثناء الاتصال بتيليجرام (getUpdates):", error)
         return None
 
-# ============ وضع الاختبار: إعلان واحد حقيقي فقط ============
+    if not data.get("ok"):
+        print("رد تيليجرام غير ناجح:", data)
+        return None
+
+    for update in reversed(data.get("result", [])):
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat") or {}
+        if chat.get("id"):
+            return str(chat["id"])
+
+    print("لا توجد رسائل للبوت. أرسل /start للبوت في تيليجرام ثم أعد التشغيل.")
+    return None
+
+
+def send_telegram_alert(text):
+    """يرسل رسالة نصية عادية."""
+    chat_id = get_chat_id()
+    if not chat_id:
+        return False
+
+    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
+    success = True
+    for start in range(0, len(text), 3900):
+        part = text[start:start + 3900]
+        try:
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": part},
+                timeout=30,
+            )
+            print("إرسال رسالة نصية:", response.status_code)
+            if not response.ok:
+                print(response.text)
+                success = False
+        except Exception as error:
+            print("خطأ في إرسال الرسالة:", error)
+            success = False
+    return success
+
+
+def send_telegram_photo(image_url, caption):
+    """يحمّل الصورة ثم يرسلها لتيليجرام مع وصف."""
+    chat_id = get_chat_id()
+    if not chat_id:
+        return False
+
+    try:
+        image_response = requests.get(image_url, headers=HEADERS, timeout=30)
+        image_response.raise_for_status()
+
+        url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendPhoto"
+        response = requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"photo": ("photo.jpg", image_response.content)},
+            timeout=60,
+        )
+        print("إرسال صورة:", response.status_code)
+        if not response.ok:
+            print(response.text)
+        return response.ok
+    except Exception as error:
+        print("خطأ في إرسال الصورة:", error)
+        return False
+
+
+# ============================================================
+# تحليل الصور (Gemini Vision)
+# ============================================================
+
+def analyze_image_full_report(image_url):
+    """يحلل صورة الإعلان ويعيد تقريراً منظماً، أو None عند الفشل."""
+    if not GEMINI_API_KEY:
+        print("مفتاح GEMINI_API_KEY غير موجود.")
+        return None
+
+    try:
+        image_response = requests.get(image_url, headers=HEADERS, timeout=30)
+        image_response.raise_for_status()
+    except Exception as error:
+        print("تعذر تحميل الصورة للتحليل:", error)
+        return None
+
+    mime_type = image_response.headers.get("Content-Type", "image/jpeg")
+    mime_type = mime_type.split(";")[0].strip()
+    if not mime_type.startswith("image/"):
+        mime_type = "image/jpeg"
+
+    prompt = (
+        "أنت خبير في قطع الحاسوب وأجهزة الألعاب المستعملة. حلّل هذه الصورة "
+        "من إعلان بيع، وأعطني تقريراً قصيراً بالعربية بهذا الشكل بالضبط:\n"
+        "القطعة: (نوع القطعة أو الجهاز)\n"
+        "الموديل: (الموديل إن ظهر، وإلا اكتب غير واضح)\n"
+        "الحالة: (جيدة / متوسطة / سيئة / غير واضح)\n"
+        "علامات التلف: (أي تلف أو غبار أو صدأ ظاهر، وإلا اكتب لا يوجد)\n"
+        "درجة الثقة: (رقم من 0 إلى 100)\n"
+        "لا تخمّن موديلاً لا يظهر في الصورة بوضوح."
+    )
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    for model_name in GEMINI_MODELS:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                [prompt, {"mime_type": mime_type, "data": image_response.content}]
+            )
+            text = (response.text or "").strip()
+            if text:
+                print("نجح تحليل الصورة بالنموذج:", model_name)
+                return text
+        except Exception as error:
+            print("فشل النموذج", model_name, ":", error)
+
+    return None
+
+
+# ============================================================
+# البحث في Craigslist
+# ============================================================
+
+def parse_price(price_text):
+    """يحوّل نص مثل $1,200 إلى رقم صحيح."""
+    digits = re.sub(r"[^\d]", "", price_text or "")
+    if not digits:
+        return None
+    return int(digits)
+
+
+def search_listings(term):
+    """يبحث في Craigslist ويعيد قائمة إعلانات (عنوان، سعر، رابط)."""
+    url = "https://" + CRAIGSLIST_CITY + ".craigslist.org/search/sss"
+    try:
+        response = requests.get(
+            url,
+            params={"query": term, "sort": "date"},
+            headers=HEADERS,
+            timeout=30,
+        )
+    except Exception as error:
+        print("خطأ في البحث عن", term, ":", error)
+        return []
+
+    print("البحث عن", term, "-> رمز الرد:", response.status_code)
+    if not response.ok:
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    results = []
+    for item in soup.select("li.cl-static-search-result")[:MAX_ITEMS_PER_SEARCH]:
+        link_tag = item.find("a")
+        title_tag = item.select_one(".title")
+        price_tag = item.select_one(".price")
+        if not link_tag or not link_tag.get("href"):
+            continue
+
+        title = title_tag.get_text(strip=True) if title_tag else "بدون عنوان"
+        price = parse_price(price_tag.get_text(strip=True)) if price_tag else None
+        results.append(
+            {"title": title, "price": price, "link": link_tag["href"]}
+        )
+
+    print("عدد الإعلانات:", len(results))
+    return results
+
+
+def get_listing_image(link):
+    """يفتح صفحة الإعلان ويعيد رابط أول صورة، أو None."""
+    try:
+        response = requests.get(link, headers=HEADERS, timeout=30)
+    except Exception as error:
+        print("تعذر فتح الإعلان:", error)
+        return None
+
+    if not response.ok:
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    meta = soup.find("meta", attrs={"property": "og:image"})
+    if meta and meta.get("content"):
+        return meta["content"]
+
+    for image in soup.find_all("img"):
+        source = image.get("src", "")
+        if "images.craigslist.org" in source:
+            return source
+
+    return None
+
+
+# ============================================================
+# تقييم الصفقات
+# ============================================================
+
+def estimate_market_value(title):
+    """يبحث في العنوان عن قطعة معروفة ويعيد (الاسم، القيمة)."""
+    compact = re.sub(r"[\s\-]+", "", title.lower())
+    for key in sorted(PRICE_TABLE, key=len, reverse=True):
+        if key in compact:
+            return key, PRICE_TABLE[key]
+    return None, 0
+
+
+def evaluate_listing(listing):
+    """يحسب الربح الصافي التقديري. يعيد None إن لم تُعرف القطعة."""
+    price = listing["price"]
+    if not price or price <= 0:
+        return None
+
+    key, market_value = estimate_market_value(listing["title"])
+    if not key:
+        return None
+
+    net_revenue = market_value * (1 - SELLING_FEE_RATE)
+    profit = net_revenue - price - SHIPPING_COST
+    return {"part": key, "market_value": market_value, "profit": round(profit)}
+
+
+# ============================================================
+# التشغيل العادي
+# ============================================================
+
+def main():
+    print("=== بدء التشغيل العادي ===")
+    seen_links = set()
+    alerts_sent = 0
+
+    for term in SEARCH_TERMS:
+        for listing in search_listings(term):
+            if listing["link"] in seen_links:
+                continue
+            seen_links.add(listing["link"])
+
+            evaluation = evaluate_listing(listing)
+            if not evaluation or evaluation["profit"] < MIN_PROFIT:
+                continue
+
+            print("صفقة محتملة:", listing["title"], listing["price"])
+            image_url = get_listing_image(listing["link"])
+            report = analyze_image_full_report(image_url) if image_url else None
+
+            message = (
+                "صفقة محتملة\n\n"
+                "العنوان: " + listing["title"] + "\n"
+                "السعر المطلوب: " + str(listing["price"]) + "$\n"
+                "القطعة المكتشفة: " + evaluation["part"] + "\n"
+                "القيمة السوقية التقديرية: " + str(evaluation["market_value"]) + "$\n"
+                "الربح الصافي التقديري: " + str(evaluation["profit"]) + "$\n"
+            )
+            if report:
+                message += "\nتحليل الصورة:\n" + report + "\n"
+            message += "\n" + listing["link"]
+
+            if image_url:
+                sent = send_telegram_photo(image_url, message)
+                if not sent:
+                    send_telegram_alert(message)
+            else:
+                send_telegram_alert(message)
+
+            alerts_sent += 1
+            if alerts_sent >= MAX_ALERTS_PER_RUN:
+                print("تم بلوغ الحد الأقصى للتنبيهات.")
+                return
+
+    print("=== انتهى التشغيل العادي. عدد التنبيهات:", alerts_sent, "===")
+
+
+# ============================================================
+# وضع الاختبار
+# ============================================================
+
 def run_vision_test():
-    print("=== بدء اختبار نظام الرؤية على إعلان واحد حقيقي ===")
-    listings = search_listings("computer parts")
-    print(f"عدد الإعلانات التي تم جلبها من الموقع: {len(listings)}")
+    print("=== بدء اختبار الرؤية ===")
+
+    if not send_telegram_alert("بدأ اختبار الرؤية. جاري البحث عن إعلان بصورة..."):
+        print("فشل الإرسال لتيليجرام. تأكد من إرسال /start للبوت ثم أعد التشغيل.")
+        return
 
     test_listing = None
-    for listing in listings:
-        if listing.get("image"):
-            test_listing = listing
+    test_image = None
+    for term in SEARCH_TERMS:
+        for listing in search_listings(term)[:15]:
+            image_url = get_listing_image(listing["link"])
+            if image_url:
+                test_listing = listing
+                test_image = image_url
+                break
+        if test_listing:
             break
 
     if not test_listing:
-        print("لم يتم العثور على أي إعلان بصورة صالحة للاختبار")
-        send_telegram_alert("⚠️ اختبار الرؤية: لم يتم العثور على إعلان بصورة للاختبار")
+        print("لم يُعثر على إعلان بصورة.")
+        send_telegram_alert("فشل الاختبار: لم يُعثر على أي إعلان بصورة.")
         return
 
-    print(f"الإعلان المختار: {test_listing['title']}")
-    print(f"السعر المعروض: {test_listing['price']}$")
-    print(f"رابط الإعلان: {test_listing['link']}")
+    print("الإعلان المختار:", test_listing["title"])
+    print("رابط الصورة:", test_image)
 
-    analysis = analyze_image_full_report(test_listing["image"], test_listing["title"])
-
+    analysis = analyze_image_full_report(test_image)
     if not analysis:
-        send_telegram_alert("⚠️ فشل اختبار الرؤية - راجع الـ Logs في GitHub Actions لمعرفة السبب")
+        send_telegram_alert("فشل تحليل الصورة عبر Gemini. راجع السجل في GitHub Actions.")
         return
 
     caption = (
-        f"🧪 اختبار نظام الرؤية\n\n"
-        f"📦 العنوان: {test_listing['title']}\n"
-        f"💰 السعر: {test_listing['price']}$\n\n"
-        f"{analysis}\n\n"
-        f"🔗 {test_listing['link']}"
+        "اختبار نظام الرؤية\n\n"
+        "العنوان: " + test_listing["title"] + "\n"
+        "السعر: " + str(test_listing["price"]) + "$\n\n"
+        + analysis + "\n\n"
+        + test_listing["link"]
     )
-    send_telegram_photo(test_listing["image"], caption)
-    print("=== انتهى الاختبار - تحقق من Telegram الآن ===")
-    if __name__ == "__main__":
-    import sys
+
+    if not send_telegram_photo(test_image, caption):
+        send_telegram_alert(caption)
+
+    print("=== انتهى الاختبار. تحقق من تيليجرام الآن ===")
+
+
+# ============================================================
+# نقطة البداية
+# ============================================================
+
+if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         run_vision_test()
     else:
