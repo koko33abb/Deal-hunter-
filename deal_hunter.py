@@ -231,8 +231,8 @@ def run_vision_test():
     send_telegram_photo(test_listing["image"], caption)
     print("=== انتهى الاختبار - تحقق من Telegram الآن ===")
     if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        run_vision_test()
-    else:
-        main()
+        import sys
+        if len(sys.argv) > 1 and sys.argv[1] == "test":
+                run_vision_test()
+        else:
+                main()
