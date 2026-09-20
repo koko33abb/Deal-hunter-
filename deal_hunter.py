@@ -14,6 +14,7 @@ Deal Hunter - النسخة الكاملة المرتبة
 import json
 import os
 import re
+import statistics
 import sys
 import warnings
 
@@ -37,19 +38,24 @@ DEFAULT_TELEGRAM_CHAT_ID = "8035757986"
 CRAIGSLIST_CITY = "losangeles"
 SEARCH_TERMS = ["gaming pc", "computer parts", "gpu"]
 
-MIN_PROFIT = 200            # الحد الأدنى للربح الصافي بالدولار
-SELLING_FEE_RATE = 0.13     # نسبة عمولة البيع التقديرية
-SHIPPING_COST = 25          # تكلفة شحن تقديرية بالدولار
+MIN_PROFIT = 200            # الحد الأدنى للربح بالدولار (القيمة ناقص سعر الشراء)
+SELLING_FEE_RATE = 0.0      # نسبة عمولة البيع (0 = بيع مباشر بلا عمولة)
+SHIPPING_COST = 0           # تكلفة شحن بالدولار (0 = استلام شخصي)
 MAX_ITEMS_PER_SEARCH = 40   # أقصى عدد إعلانات يُفحص لكل كلمة بحث
 MAX_ALERTS_PER_RUN = 5      # أقصى عدد تنبيهات في التشغيل الواحد
 SEEN_FILE = "seen_deals.json"   # ملف يحفظ الصفقات التي أُرسلت سابقاً
 MAX_SEEN = 500                  # أقصى عدد روابط محفوظة في الذاكرة
+COMPS_MIN_SAMPLES = 5           # أقل عدد إعلانات مماثلة لاعتماد القيمة السوقية
+MIN_VISION_CONFIDENCE = 70      # أقل ثقة في تعرّف الصورة لإصدار قرار شراء
 
 # النماذج تُجرَّب بالترتيب حتى ينجح أحدها (ثم تُكتشف نماذج أخرى تلقائياً)
 GEMINI_MODELS = ["gemini-3.6-flash"]
 
 # كلمات بحث وضع الاختبار: نبحث عن كروت شاشة حقيقية بدل الكابلات والإكسسوارات
 TEST_SEARCH_TERMS = ["rtx 3070", "rtx 3080", "rtx 4070", "rtx 3060"]
+
+# كلمات بحث الاختبار الثاني: ملحقات تحمل اسم منتج معروف (مثل سماعة PS5)
+TEST_ACCESSORY_TERMS = ["ps5 headset", "ps5 controller", "ps5 charging station"]
 
 # أسباب فشل Gemini تُحفظ هنا ليُرسَل ملخصها لتيليجرام
 GEMINI_ERRORS = []
@@ -62,31 +68,81 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# جدول أسعار السوق التقريبية (بالدولار) - يمكن تعديله يدوياً لاحقاً
-PRICE_TABLE = {
-    "rtx4090": 1500,
-    "rtx4080super": 950,
-    "rtx4080": 900,
-    "rtx4070tisuper": 750,
-    "rtx4070ti": 650,
-    "rtx4070super": 550,
-    "rtx4070": 480,
-    "rtx4060ti": 350,
-    "rtx4060": 270,
-    "rtx3090ti": 750,
-    "rtx3090": 650,
-    "rtx3080ti": 450,
-    "rtx3080": 380,
-    "rtx3070ti": 280,
-    "rtx3070": 240,
-    "rtx3060ti": 200,
-    "rtx3060": 160,
-    "rx7900xtx": 800,
-    "rx7900xt": 650,
-    "rx6800xt": 300,
-    "rx6700xt": 200,
-    "ps5": 400,
+# الأصناف المعروفة: المفتاح -> (كلمة البحث عن إعلانات مماثلة، الصنف المتوقع من الصورة)
+# لا توجد هنا أي أسعار: القيمة السوقية تُحسب من إعلانات مماثلة حقيقية فقط
+KNOWN_PARTS = {
+    "rtx4090": ("rtx 4090", "graphics_card"),
+    "rtx4080super": ("rtx 4080 super", "graphics_card"),
+    "rtx4080": ("rtx 4080", "graphics_card"),
+    "rtx4070tisuper": ("rtx 4070 ti super", "graphics_card"),
+    "rtx4070ti": ("rtx 4070 ti", "graphics_card"),
+    "rtx4070super": ("rtx 4070 super", "graphics_card"),
+    "rtx4070": ("rtx 4070", "graphics_card"),
+    "rtx4060ti": ("rtx 4060 ti", "graphics_card"),
+    "rtx4060": ("rtx 4060", "graphics_card"),
+    "rtx3090ti": ("rtx 3090 ti", "graphics_card"),
+    "rtx3090": ("rtx 3090", "graphics_card"),
+    "rtx3080ti": ("rtx 3080 ti", "graphics_card"),
+    "rtx3080": ("rtx 3080", "graphics_card"),
+    "rtx3070ti": ("rtx 3070 ti", "graphics_card"),
+    "rtx3070": ("rtx 3070", "graphics_card"),
+    "rtx3060ti": ("rtx 3060 ti", "graphics_card"),
+    "rtx3060": ("rtx 3060", "graphics_card"),
+    "rx7900xtx": ("rx 7900 xtx", "graphics_card"),
+    "rx7900xt": ("rx 7900 xt", "graphics_card"),
+    "rx6800xt": ("rx 6800 xt", "graphics_card"),
+    "rx6700xt": ("rx 6700 xt", "graphics_card"),
+    "ps5": ("ps5 console", "console"),
 }
+
+# الأصناف التي يُسمح لـ Gemini بإرجاعها، مع أسمائها بالعربية
+VISION_CATEGORIES = {
+    "graphics_card": "كرت شاشة",
+    "console": "جهاز ألعاب",
+    "headset": "سماعة",
+    "controller": "يد تحكم",
+    "keyboard": "لوحة مفاتيح",
+    "mouse": "فأرة",
+    "monitor": "شاشة",
+    "cable": "كابل",
+    "pc_case": "صندوق حاسوب",
+    "motherboard": "لوحة أم",
+    "cpu": "معالج",
+    "ram": "ذاكرة عشوائية",
+    "ssd": "قرص تخزين",
+    "laptop": "حاسوب محمول",
+    "desktop_pc": "حاسوب مكتبي كامل",
+    "phone": "هاتف",
+    "other": "أخرى",
+}
+
+# كلمات في العنوان تدل على ملحق وليس القطعة نفسها
+ACCESSORY_WORDS = [
+    "headset", "headphone", "earbud", "earphone", "controller", "gamepad",
+    "joystick", "charger", "charging", "stand", "case", "cover", "skin",
+    "cable", "adapter", "dock", "bracket", "riser", "backplate",
+    "waterblock", "water block", "box only", "empty box", "keyboard",
+    "mouse", "monitor",
+]
+
+# كلمات تدل على تلف أو عطل أو عدم فحص
+BROKEN_WORDS = [
+    "for parts", "parts only", "broken", "not working", "doesn't work",
+    "doesnt work", "does not work", "damaged", "dead", "no display",
+    "artifact", "artifacts", "faulty", "defective", "repair", "untested",
+]
+
+# كلمات تدل على جهاز كامل أو حزمة (لا تصلح للمقارنة بالقطعة المنفردة)
+BUNDLE_WORDS = [
+    "desktop", "laptop", "computer", "prebuilt", "pre built", "tower",
+    "gaming pc", "custom pc", "pc build", "rig", "bundle", "combo", "lot",
+]
+
+# قرارات النظام
+DECISION_BUY = "شراء محتمل"
+DECISION_REVIEW = "مراجعة يدوية"
+DECISION_UNKNOWN = "لا قرار (القيمة السوقية غير معروفة)"
+DECISION_SKIP = "تجاهل (الربح أقل من الحد)"
 
 
 # ============================================================
@@ -223,14 +279,21 @@ def analyze_image_full_report(image_url):
         mime_type = "image/jpeg"
 
     prompt = (
-        "أنت خبير في قطع الحاسوب وأجهزة الألعاب المستعملة. حلّل هذه الصورة "
-        "من إعلان بيع، وأعطني تقريراً قصيراً بالعربية بهذا الشكل بالضبط:\n"
-        "القطعة: (نوع القطعة أو الجهاز)\n"
-        "الموديل: (الموديل إن ظهر، وإلا اكتب غير واضح)\n"
-        "الحالة: (جيدة / متوسطة / سيئة / غير واضح)\n"
-        "علامات التلف: (أي تلف أو غبار أو صدأ ظاهر، وإلا اكتب لا يوجد)\n"
-        "درجة الثقة: (رقم من 0 إلى 100)\n"
-        "لا تخمّن موديلاً لا يظهر في الصورة بوضوح."
+        "أنت خبير في تعريف قطع الحاسوب وأجهزة الألعاب المستعملة من الصور. "
+        "انظر إلى الصورة فقط، ولا تخمّن ما لا يظهر فيها. "
+        "أعد JSON فقط بلا أي نص قبله أو بعده وبلا علامات تنسيق أو backticks، بالمفاتيح التالية بالضبط:\n"
+        "{\n"
+        '  "category": "واحدة فقط من: ' + ", ".join(VISION_CATEGORIES) + '",\n'
+        '  "brand": "العلامة التجارية كما تظهر في الصورة، وإلا: غير واضح",\n'
+        '  "model": "الموديل كما يظهر مكتوباً على المنتج أو علبته، وإلا: غير واضح",\n'
+        '  "condition": "جيدة أو متوسطة أو سيئة أو غير واضح",\n'
+        '  "damage": "وصف أي تلف ظاهر، وإلا: لا يوجد",\n'
+        '  "confidence": "رقم من 0 إلى 100 يعبّر عن ثقتك في الصنف والموديل معاً"\n'
+        "}\n"
+        "القاعدة الأهم: الصنف هو ما تراه فعلاً في الصورة. "
+        "السماعة تبقى headset حتى لو كُتب على علبتها أنها تناسب جهاز ألعاب، "
+        "ولا تكتب console إلا إذا ظهر جهاز الألعاب نفسه. "
+        "لا تكتب موديلاً إلا إذا كان مكتوباً أو واضحاً في الصورة."
     )
 
     genai.configure(api_key=GEMINI_API_KEY)
@@ -266,6 +329,51 @@ def try_gemini_model(model_name, prompt, mime_type, image_bytes):
     except Exception as error:
         record_gemini_error(model_name + ": " + str(error))
     return None
+
+
+def parse_vision_json(text):
+    """يحوّل رد Gemini إلى قاموس نظيف، أو None إن لم يكن JSON صالحاً."""
+    if not text:
+        return None
+    cleaned = re.sub(r"`{3}(?:json)?", "", text).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(cleaned[start:end + 1])
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    category = str(data.get("category", "other")).strip().lower()
+    if category not in VISION_CATEGORIES:
+        category = "other"
+    try:
+        confidence = int(float(data.get("confidence", 0)))
+    except (TypeError, ValueError):
+        confidence = 0
+
+    return {
+        "category": category,
+        "brand": str(data.get("brand", "غير واضح")).strip()[:60] or "غير واضح",
+        "model": str(data.get("model", "غير واضح")).strip()[:60] or "غير واضح",
+        "condition": str(data.get("condition", "غير واضح")).strip()[:40] or "غير واضح",
+        "damage": str(data.get("damage", "غير واضح")).strip()[:120] or "غير واضح",
+        "confidence": max(0, min(100, confidence)),
+    }
+
+
+def analyze_image_structured(image_url):
+    """يحلل الصورة ويعيد قاموساً منظماً (الصنف والموديل والحالة...) أو None."""
+    text = analyze_image_full_report(image_url)
+    if not text:
+        return None
+    data = parse_vision_json(text)
+    if data is None:
+        record_gemini_error("تعذر قراءة رد Gemini كـ JSON: " + text[:120])
+    return data
 
 
 # ============================================================
@@ -346,186 +454,124 @@ def get_listing_image(link):
 # تقييم الصفقات
 # ============================================================
 
-def estimate_market_value(title):
-    """يبحث في العنوان عن قطعة معروفة ويعيد (الاسم، القيمة)."""
+def match_known_part(title):
+    """يبحث في العنوان عن اسم قطعة معروفة ويعيد مفتاحها أو None."""
     compact = re.sub(r"[\s\-]+", "", title.lower())
-    for key in sorted(PRICE_TABLE, key=len, reverse=True):
+    for key in sorted(KNOWN_PARTS, key=len, reverse=True):
         if key in compact:
-            return key, PRICE_TABLE[key]
-    return None, 0
+            return key
+    return None
 
 
-def evaluate_listing(listing):
-    """يحسب الربح الصافي التقديري. يعيد None إن لم تُعرف القطعة."""
-    price = listing["price"]
-    if not price or price <= 0:
-        return None
+def has_word(text, words):
+    """هل يحوي النص إحدى الكلمات (ككلمة كاملة، مع جمعها بحرف s)؟"""
+    lowered = text.lower()
+    for word in words:
+        pattern = r"(?<![a-z0-9])" + re.escape(word) + r"s?(?![a-z0-9])"
+        if re.search(pattern, lowered):
+            return True
+    return False
 
-    key, market_value = estimate_market_value(listing["title"])
+
+def is_damage_free(damage_text):
+    """هل وصف التلف يعني عدم وجود تلف ظاهر؟"""
+    text = (damage_text or "").strip().lower()
+    return text in ("", "none", "no") or text.startswith("لا يوجد") or text.startswith("لا شيء")
+
+
+def prefilter_listing(listing):
+    """فحص سريع على العنوان قبل أي تحليل. يعيد (مفتاح القطعة، سبب الرفض)."""
+    title = listing["title"]
+    key = match_known_part(title)
     if not key:
+        return None, ""
+    if not listing["price"] or listing["price"] <= 0:
+        return None, ""
+    if has_word(title, ACCESSORY_WORDS):
+        return None, "العنوان يذكر " + key + " لكنه يصف ملحقاً"
+    if has_word(title, BROKEN_WORDS):
+        return None, "العنوان يشير إلى تلف أو عطل"
+    return key, ""
+
+
+_COMPS_CACHE = {}
+
+
+def get_comparable_stats(part_key):
+    """يحسب وسيط أسعار إعلانات مماثلة حالية في المدينة نفسها، أو None إن لم تكفِ."""
+    if part_key in _COMPS_CACHE:
+        return _COMPS_CACHE[part_key]
+
+    query = KNOWN_PARTS[part_key][0]
+    prices = []
+    for item in search_listings(query):
+        if match_known_part(item["title"]) != part_key:
+            continue
+        if not item["price"] or item["price"] <= 0:
+            continue
+        if has_word(item["title"], ACCESSORY_WORDS + BROKEN_WORDS + BUNDLE_WORDS):
+            continue
+        prices.append(item["price"])
+
+    stats = None
+    if len(prices) >= COMPS_MIN_SAMPLES:
+        rough = statistics.median(prices)
+        kept = [price for price in prices if 0.4 * rough <= price <= 2.5 * rough]
+        if len(kept) >= COMPS_MIN_SAMPLES:
+            stats = {"median": round(statistics.median(kept)), "count": len(kept)}
+
+    print("بيانات المقارنة لـ", part_key, ":", stats)
+    _COMPS_CACHE[part_key] = stats
+    return stats
+
+
+def compute_valuation(listing, part_key):
+    """يعيد القيمة السوقية والربح، أو None إن لم تتوفر بيانات مقارنة كافية."""
+    stats = get_comparable_stats(part_key)
+    if not stats:
         return None
-
-    net_revenue = market_value * (1 - SELLING_FEE_RATE)
-    profit = net_revenue - price - SHIPPING_COST
-    return {"part": key, "market_value": market_value, "profit": round(profit)}
-
-
-# ============================================================
-# ذاكرة الصفقات المرسلة (لمنع تكرار التنبيه)
-# ============================================================
-
-def load_seen():
-    """يقرأ قائمة الروابط المرسلة سابقاً."""
-    try:
-        with open(SEEN_FILE, encoding="utf-8") as file:
-            data = json.load(file)
-        if isinstance(data, list):
-            return data
-    except FileNotFoundError:
-        pass
-    except Exception as error:
-        print("تعذر قراءة ملف الذاكرة:", error)
-    return []
+    value = stats["median"]
+    profit = round(value * (1 - SELLING_FEE_RATE) - listing["price"] - SHIPPING_COST)
+    return {"value": value, "count": stats["count"], "profit": profit}
 
 
-def save_seen(seen_list):
-    """يحفظ آخر الروابط المرسلة."""
-    try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as file:
-            json.dump(seen_list[-MAX_SEEN:], file, ensure_ascii=False, indent=0)
-    except Exception as error:
-        print("تعذر حفظ ملف الذاكرة:", error)
+def assess_listing(listing, image_url):
+    """يجمع الفحوص كلها ويعيد قراراً منظماً مع أسبابه."""
+    title = listing["title"]
+    title_key = match_known_part(title)
+    vision = analyze_image_structured(image_url) if image_url else None
+    notes = []
+    blocked = False
 
-
-# ============================================================
-# التشغيل العادي
-# ============================================================
-
-def main():
-    print("=== بدء التشغيل العادي ===")
-    seen_links = set()
-    sent_list = load_seen()
-    sent_set = set(sent_list)
-    alerts_sent = 0
-
-    for term in SEARCH_TERMS:
-        for listing in search_listings(term):
-            link = listing["link"]
-            if link in seen_links:
-                continue
-            seen_links.add(link)
-
-            evaluation = evaluate_listing(listing)
-            if not evaluation or evaluation["profit"] < MIN_PROFIT:
-                continue
-
-            if link in sent_set:
-                print("أُرسلت هذه الصفقة سابقاً، تُتجاهل:", listing["title"])
-                continue
-
-            print("صفقة محتملة:", listing["title"], listing["price"])
-            image_url = get_listing_image(link)
-            report = analyze_image_full_report(image_url) if image_url else None
-
-            message = (
-                "صفقة محتملة\n\n"
-                "العنوان: " + listing["title"] + "\n"
-                "السعر المطلوب: " + str(listing["price"]) + "$\n"
-                "القطعة المكتشفة: " + evaluation["part"] + "\n"
-                "القيمة السوقية التقديرية: " + str(evaluation["market_value"]) + "$\n"
-                "الربح الصافي التقديري: " + str(evaluation["profit"]) + "$\n"
-            )
-            if report:
-                message += "\nتحليل الصورة:\n" + report + "\n"
-            message += "\n" + link
-
-            if image_url:
-                sent = send_telegram_photo(image_url, message) or send_telegram_alert(message)
-            else:
-                sent = send_telegram_alert(message)
-
-            if sent:
-                sent_list.append(link)
-                sent_set.add(link)
-                save_seen(sent_list)
-                alerts_sent += 1
-                if alerts_sent >= MAX_ALERTS_PER_RUN:
-                    print("تم بلوغ الحد الأقصى للتنبيهات.")
-                    return
-
-    save_seen(sent_list)
-    print("=== انتهى التشغيل العادي. عدد التنبيهات:", alerts_sent, "===")
-
-
-# ============================================================
-# وضع الاختبار
-# ============================================================
-
-def find_test_listing():
-    """يختار إعلاناً للاختبار: يفضّل كرت شاشة معروفاً، ثم أي إعلان بصورة."""
-    # الجولة الأولى: إعلانات يعرفها جدول الأسعار (كروت شاشة)
-    for term in TEST_SEARCH_TERMS:
-        for listing in search_listings(term)[:15]:
-            key, _ = estimate_market_value(listing["title"])
-            if not key:
-                continue
-            image_url = get_listing_image(listing["link"])
-            if image_url:
-                return listing, image_url
-
-    # الجولة الثانية: أي إعلان له صورة
-    for term in SEARCH_TERMS:
-        for listing in search_listings(term)[:15]:
-            image_url = get_listing_image(listing["link"])
-            if image_url:
-                return listing, image_url
-
-    return None, None
-
-
-def run_vision_test():
-    print("=== بدء اختبار الرؤية ===")
-
-    if not send_telegram_alert("بدأ اختبار الرؤية. جاري البحث عن إعلان بصورة..."):
-        print("فشل الإرسال لتيليجرام. تأكد من إرسال /start للبوت ثم أعد التشغيل.")
-        return
-
-    test_listing, test_image = find_test_listing()
-
-    if not test_listing:
-        print("لم يُعثر على إعلان بصورة.")
-        send_telegram_alert("فشل الاختبار: لم يُعثر على أي إعلان بصورة.")
-        return
-
-    print("الإعلان المختار:", test_listing["title"])
-    print("رابط الصورة:", test_image)
-
-    analysis = analyze_image_full_report(test_image)
-    if not analysis:
-        reasons = "\n".join(GEMINI_ERRORS[-4:]) or "سبب غير معروف"
-        send_telegram_alert("فشل تحليل الصورة عبر Gemini.\n\nالأسباب:\n" + reasons)
-        return
-
-    caption = (
-        "اختبار نظام الرؤية\n\n"
-        "العنوان: " + test_listing["title"] + "\n"
-        "السعر: " + str(test_listing["price"]) + "$\n\n"
-        + analysis + "\n\n"
-        + test_listing["link"]
-    )
-
-    if not send_telegram_photo(test_image, caption):
-        send_telegram_alert(caption)
-
-    print("=== انتهى الاختبار. تحقق من تيليجرام الآن ===")
-
-
-# ============================================================
-# نقطة البداية
-# ============================================================
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        run_vision_test()
+    if not title_key:
+        notes.append("لا يوجد اسم قطعة معروفة في العنوان")
     else:
-        main()
+        expected = KNOWN_PARTS[title_key][1]
+        if has_word(title, ACCESSORY_WORDS):
+            blocked = True
+            notes.append("العنوان يذكر " + title_key + " لكنه يصف ملحقاً وليس القطعة نفسها")
+        if has_word(title, BROKEN_WORDS):
+            blocked = True
+            notes.append("العنوان يشير إلى تلف أو عطل")
+        if vision and vision["category"] != expected:
+            blocked = True
+            notes.append(
+                "تعارض: العنوان يشير إلى " + title_key + " ("
+                + VISION_CATEGORIES[expected] + ") لكن الصورة تُظهر: "
+                + VISION_CATEGORIES[vision["category"]]
+            )
+
+    valuation = None
+    if title_key and not blocked and listing["price"]:
+        valuation = compute_valuation(listing, title_key)
+        if not valuation:
+            notes.append("لا توجد إعلانات مماثلة كافية لتقدير القيمة السوقية")
+
+    if blocked:
+        decision = DECISION_REVIEW
+    elif vision is None:
+        decision = DECISION_REVIEW
+        notes.append("تعذر تحليل الصورة")
+    elif not valuation:
+        decision = DECISION_UNKNOWN
+    elif valuati
