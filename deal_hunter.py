@@ -11,6 +11,7 @@ Deal Hunter - النسخة الكاملة المرتبة
     GEMINI_API_KEY
 """
 
+import json
 import os
 import re
 import sys
@@ -41,6 +42,8 @@ SELLING_FEE_RATE = 0.13     # نسبة عمولة البيع التقديرية
 SHIPPING_COST = 25          # تكلفة شحن تقديرية بالدولار
 MAX_ITEMS_PER_SEARCH = 40   # أقصى عدد إعلانات يُفحص لكل كلمة بحث
 MAX_ALERTS_PER_RUN = 5      # أقصى عدد تنبيهات في التشغيل الواحد
+SEEN_FILE = "seen_deals.json"   # ملف يحفظ الصفقات التي أُرسلت سابقاً
+MAX_SEEN = 500                  # أقصى عدد روابط محفوظة في الذاكرة
 
 # النماذج تُجرَّب بالترتيب حتى ينجح أحدها (ثم تُكتشف نماذج أخرى تلقائياً)
 GEMINI_MODELS = ["gemini-3.6-flash"]
@@ -368,26 +371,60 @@ def evaluate_listing(listing):
 
 
 # ============================================================
+# ذاكرة الصفقات المرسلة (لمنع تكرار التنبيه)
+# ============================================================
+
+def load_seen():
+    """يقرأ قائمة الروابط المرسلة سابقاً."""
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as file:
+            data = json.load(file)
+        if isinstance(data, list):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as error:
+        print("تعذر قراءة ملف الذاكرة:", error)
+    return []
+
+
+def save_seen(seen_list):
+    """يحفظ آخر الروابط المرسلة."""
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as file:
+            json.dump(seen_list[-MAX_SEEN:], file, ensure_ascii=False, indent=0)
+    except Exception as error:
+        print("تعذر حفظ ملف الذاكرة:", error)
+
+
+# ============================================================
 # التشغيل العادي
 # ============================================================
 
 def main():
     print("=== بدء التشغيل العادي ===")
     seen_links = set()
+    sent_list = load_seen()
+    sent_set = set(sent_list)
     alerts_sent = 0
 
     for term in SEARCH_TERMS:
         for listing in search_listings(term):
-            if listing["link"] in seen_links:
+            link = listing["link"]
+            if link in seen_links:
                 continue
-            seen_links.add(listing["link"])
+            seen_links.add(link)
 
             evaluation = evaluate_listing(listing)
             if not evaluation or evaluation["profit"] < MIN_PROFIT:
                 continue
 
+            if link in sent_set:
+                print("أُرسلت هذه الصفقة سابقاً، تُتجاهل:", listing["title"])
+                continue
+
             print("صفقة محتملة:", listing["title"], listing["price"])
-            image_url = get_listing_image(listing["link"])
+            image_url = get_listing_image(link)
             report = analyze_image_full_report(image_url) if image_url else None
 
             message = (
@@ -400,20 +437,23 @@ def main():
             )
             if report:
                 message += "\nتحليل الصورة:\n" + report + "\n"
-            message += "\n" + listing["link"]
+            message += "\n" + link
 
             if image_url:
-                sent = send_telegram_photo(image_url, message)
-                if not sent:
-                    send_telegram_alert(message)
+                sent = send_telegram_photo(image_url, message) or send_telegram_alert(message)
             else:
-                send_telegram_alert(message)
+                sent = send_telegram_alert(message)
 
-            alerts_sent += 1
-            if alerts_sent >= MAX_ALERTS_PER_RUN:
-                print("تم بلوغ الحد الأقصى للتنبيهات.")
-                return
+            if sent:
+                sent_list.append(link)
+                sent_set.add(link)
+                save_seen(sent_list)
+                alerts_sent += 1
+                if alerts_sent >= MAX_ALERTS_PER_RUN:
+                    print("تم بلوغ الحد الأقصى للتنبيهات.")
+                    return
 
+    save_seen(sent_list)
     print("=== انتهى التشغيل العادي. عدد التنبيهات:", alerts_sent, "===")
 
 
