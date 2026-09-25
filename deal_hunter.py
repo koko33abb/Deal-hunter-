@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Deal Hunter - النسخة الكاملة المرتبة
+Deal Hunter - الملف الرئيسي
 
 طريقة التشغيل:
     python deal_hunter.py          -> التشغيل العادي (البحث عن صفقات)
-    python deal_hunter.py test     -> وضع الاختبار (تحليل صورة + إرسالها لتيليجرام)
+    python deal_hunter.py test     -> وضع الاختبار (اختباران على إعلانات حقيقية)
+
+يعتمد على الملف dh_core.py (الإعدادات وتيليجرام وGemini) الموجود بجانبه.
 
 المتغيرات السرية المطلوبة (GitHub Secrets):
     TELEGRAM_BOT_TOKEN
@@ -12,368 +14,14 @@ Deal Hunter - النسخة الكاملة المرتبة
 """
 
 import json
-import os
 import re
 import statistics
 import sys
-import warnings
 
 import requests
 from bs4 import BeautifulSoup
 
-warnings.filterwarnings("ignore")
-import google.generativeai as genai  # noqa: E402
-
-
-# ============================================================
-# الإعدادات
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-
-# رقم محادثتك مع البوت (ليس سراً: لا يُستخدم دون توكن البوت)
-DEFAULT_TELEGRAM_CHAT_ID = "8035757986"
-
-CRAIGSLIST_CITY = "losangeles"
-SEARCH_TERMS = ["gaming pc", "computer parts", "gpu"]
-
-MIN_PROFIT = 200            # الحد الأدنى للربح بالدولار (القيمة ناقص سعر الشراء)
-SELLING_FEE_RATE = 0.0      # نسبة عمولة البيع (0 = بيع مباشر بلا عمولة)
-SHIPPING_COST = 0           # تكلفة شحن بالدولار (0 = استلام شخصي)
-MAX_ITEMS_PER_SEARCH = 40   # أقصى عدد إعلانات يُفحص لكل كلمة بحث
-MAX_ALERTS_PER_RUN = 5      # أقصى عدد تنبيهات في التشغيل الواحد
-SEEN_FILE = "seen_deals.json"   # ملف يحفظ الصفقات التي أُرسلت سابقاً
-MAX_SEEN = 500                  # أقصى عدد روابط محفوظة في الذاكرة
-COMPS_MIN_SAMPLES = 5           # أقل عدد إعلانات مماثلة لاعتماد القيمة السوقية
-MIN_VISION_CONFIDENCE = 70      # أقل ثقة في تعرّف الصورة لإصدار قرار شراء
-
-# النماذج تُجرَّب بالترتيب حتى ينجح أحدها (ثم تُكتشف نماذج أخرى تلقائياً)
-GEMINI_MODELS = ["gemini-3.6-flash"]
-
-# كلمات بحث وضع الاختبار: نبحث عن كروت شاشة حقيقية بدل الكابلات والإكسسوارات
-TEST_SEARCH_TERMS = ["rtx 3070", "rtx 3080", "rtx 4070", "rtx 3060"]
-
-# كلمات بحث الاختبار الثاني: ملحقات تحمل اسم منتج معروف (مثل سماعة PS5)
-TEST_ACCESSORY_TERMS = ["ps5 headset", "ps5 controller", "ps5 charging station"]
-
-# أسباب فشل Gemini تُحفظ هنا ليُرسَل ملخصها لتيليجرام
-GEMINI_ERRORS = []
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# الأصناف المعروفة: المفتاح -> (كلمة البحث عن إعلانات مماثلة، الصنف المتوقع من الصورة)
-# لا توجد هنا أي أسعار: القيمة السوقية تُحسب من إعلانات مماثلة حقيقية فقط
-KNOWN_PARTS = {
-    "rtx4090": ("rtx 4090", "graphics_card"),
-    "rtx4080super": ("rtx 4080 super", "graphics_card"),
-    "rtx4080": ("rtx 4080", "graphics_card"),
-    "rtx4070tisuper": ("rtx 4070 ti super", "graphics_card"),
-    "rtx4070ti": ("rtx 4070 ti", "graphics_card"),
-    "rtx4070super": ("rtx 4070 super", "graphics_card"),
-    "rtx4070": ("rtx 4070", "graphics_card"),
-    "rtx4060ti": ("rtx 4060 ti", "graphics_card"),
-    "rtx4060": ("rtx 4060", "graphics_card"),
-    "rtx3090ti": ("rtx 3090 ti", "graphics_card"),
-    "rtx3090": ("rtx 3090", "graphics_card"),
-    "rtx3080ti": ("rtx 3080 ti", "graphics_card"),
-    "rtx3080": ("rtx 3080", "graphics_card"),
-    "rtx3070ti": ("rtx 3070 ti", "graphics_card"),
-    "rtx3070": ("rtx 3070", "graphics_card"),
-    "rtx3060ti": ("rtx 3060 ti", "graphics_card"),
-    "rtx3060": ("rtx 3060", "graphics_card"),
-    "rx7900xtx": ("rx 7900 xtx", "graphics_card"),
-    "rx7900xt": ("rx 7900 xt", "graphics_card"),
-    "rx6800xt": ("rx 6800 xt", "graphics_card"),
-    "rx6700xt": ("rx 6700 xt", "graphics_card"),
-    "ps5": ("ps5 console", "console"),
-}
-
-# الأصناف التي يُسمح لـ Gemini بإرجاعها، مع أسمائها بالعربية
-VISION_CATEGORIES = {
-    "graphics_card": "كرت شاشة",
-    "console": "جهاز ألعاب",
-    "headset": "سماعة",
-    "controller": "يد تحكم",
-    "keyboard": "لوحة مفاتيح",
-    "mouse": "فأرة",
-    "monitor": "شاشة",
-    "cable": "كابل",
-    "pc_case": "صندوق حاسوب",
-    "motherboard": "لوحة أم",
-    "cpu": "معالج",
-    "ram": "ذاكرة عشوائية",
-    "ssd": "قرص تخزين",
-    "laptop": "حاسوب محمول",
-    "desktop_pc": "حاسوب مكتبي كامل",
-    "phone": "هاتف",
-    "other": "أخرى",
-}
-
-# كلمات في العنوان تدل على ملحق وليس القطعة نفسها
-ACCESSORY_WORDS = [
-    "headset", "headphone", "earbud", "earphone", "controller", "gamepad",
-    "joystick", "charger", "charging", "stand", "case", "cover", "skin",
-    "cable", "adapter", "dock", "bracket", "riser", "backplate",
-    "waterblock", "water block", "box only", "empty box", "keyboard",
-    "mouse", "monitor",
-]
-
-# كلمات تدل على تلف أو عطل أو عدم فحص
-BROKEN_WORDS = [
-    "for parts", "parts only", "broken", "not working", "doesn't work",
-    "doesnt work", "does not work", "damaged", "dead", "no display",
-    "artifact", "artifacts", "faulty", "defective", "repair", "untested",
-]
-
-# كلمات تدل على جهاز كامل أو حزمة (لا تصلح للمقارنة بالقطعة المنفردة)
-BUNDLE_WORDS = [
-    "desktop", "laptop", "computer", "prebuilt", "pre built", "tower",
-    "gaming pc", "custom pc", "pc build", "rig", "bundle", "combo", "lot",
-]
-
-# قرارات النظام
-DECISION_BUY = "شراء محتمل"
-DECISION_REVIEW = "مراجعة يدوية"
-DECISION_UNKNOWN = "لا قرار (القيمة السوقية غير معروفة)"
-DECISION_SKIP = "تجاهل (الربح أقل من الحد)"
-
-
-# ============================================================
-# تيليجرام
-# ============================================================
-
-def get_chat_id():
-    """يجلب رقم المحادثة. يتطلب أن يكون المستخدم قد أرسل /start للبوت."""
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or DEFAULT_TELEGRAM_CHAT_ID
-    if chat_id:
-        return chat_id
-
-    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/getUpdates"
-    try:
-        response = requests.get(url, timeout=30)
-        data = response.json()
-    except Exception as error:
-        print("خطأ أثناء الاتصال بتيليجرام (getUpdates):", error)
-        return None
-
-    if not data.get("ok"):
-        print("رد تيليجرام غير ناجح:", data)
-        return None
-
-    for update in reversed(data.get("result", [])):
-        message = update.get("message") or update.get("edited_message") or {}
-        chat = message.get("chat") or {}
-        if chat.get("id"):
-            return str(chat["id"])
-
-    print("لا توجد رسائل للبوت. أرسل /start للبوت في تيليجرام ثم أعد التشغيل.")
-    return None
-
-
-def send_telegram_alert(text):
-    """يرسل رسالة نصية عادية."""
-    chat_id = get_chat_id()
-    if not chat_id:
-        return False
-
-    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
-    success = True
-    for start in range(0, len(text), 3900):
-        part = text[start:start + 3900]
-        try:
-            response = requests.post(
-                url,
-                data={"chat_id": chat_id, "text": part},
-                timeout=30,
-            )
-            print("إرسال رسالة نصية:", response.status_code)
-            if not response.ok:
-                print(response.text)
-                success = False
-        except Exception as error:
-            print("خطأ في إرسال الرسالة:", error)
-            success = False
-    return success
-
-
-def send_telegram_photo(image_url, caption):
-    """يحمّل الصورة ثم يرسلها لتيليجرام مع وصف."""
-    chat_id = get_chat_id()
-    if not chat_id:
-        return False
-
-    try:
-        image_response = requests.get(image_url, headers=HEADERS, timeout=30)
-        image_response.raise_for_status()
-
-        url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendPhoto"
-        response = requests.post(
-            url,
-            data={"chat_id": chat_id, "caption": caption[:1000]},
-            files={"photo": ("photo.jpg", image_response.content)},
-            timeout=60,
-        )
-        print("إرسال صورة:", response.status_code)
-        if not response.ok:
-            print(response.text)
-        return response.ok
-    except Exception as error:
-        print("خطأ في إرسال الصورة:", error)
-        return False
-
-
-# ============================================================
-# تحليل الصور (Gemini Vision)
-# ============================================================
-
-def record_gemini_error(message):
-    """يحفظ سبب الفشل بعد إخفاء مفتاح Gemini إن ظهر فيه."""
-    text = str(message)
-    if GEMINI_API_KEY:
-        text = text.replace(GEMINI_API_KEY, "***")
-    text = text.replace("\n", " ")[:300]
-    print("سبب الفشل:", text)
-    GEMINI_ERRORS.append(text)
-
-
-def discover_gemini_models():
-    """يسأل Gemini عن النماذج المتاحة لهذا المفتاح، ويعيد أسماء نماذج flash."""
-    names = []
-    try:
-        for model in genai.list_models():
-            methods = model.supported_generation_methods or []
-            name = model.name.replace("models/", "")
-            if "generateContent" not in methods or "flash" not in name:
-                continue
-            if any(word in name for word in ["image", "tts", "live", "audio"]):
-                continue
-            names.append(name)
-    except Exception as error:
-        record_gemini_error("تعذر جلب قائمة النماذج: " + str(error))
-    return names[:5]
-
-
-def analyze_image_full_report(image_url):
-    """يحلل صورة الإعلان ويعيد تقريراً منظماً، أو None عند الفشل."""
-    if not GEMINI_API_KEY:
-        record_gemini_error("مفتاح GEMINI_API_KEY غير موجود في GitHub Secrets")
-        return None
-
-    try:
-        image_response = requests.get(image_url, headers=HEADERS, timeout=30)
-        image_response.raise_for_status()
-    except Exception as error:
-        record_gemini_error("تعذر تحميل الصورة للتحليل: " + str(error))
-        return None
-
-    mime_type = image_response.headers.get("Content-Type", "image/jpeg")
-    mime_type = mime_type.split(";")[0].strip()
-    if not mime_type.startswith("image/"):
-        mime_type = "image/jpeg"
-
-    prompt = (
-        "أنت خبير في تعريف قطع الحاسوب وأجهزة الألعاب المستعملة من الصور. "
-        "انظر إلى الصورة فقط، ولا تخمّن ما لا يظهر فيها. "
-        "أعد JSON فقط بلا أي نص قبله أو بعده وبلا علامات تنسيق أو backticks، بالمفاتيح التالية بالضبط:\n"
-        "{\n"
-        '  "category": "واحدة فقط من: ' + ", ".join(VISION_CATEGORIES) + '",\n'
-        '  "brand": "العلامة التجارية كما تظهر في الصورة، وإلا: غير واضح",\n'
-        '  "model": "الموديل كما يظهر مكتوباً على المنتج أو علبته، وإلا: غير واضح",\n'
-        '  "condition": "جيدة أو متوسطة أو سيئة أو غير واضح",\n'
-        '  "damage": "وصف أي تلف ظاهر، وإلا: لا يوجد",\n'
-        '  "confidence": "رقم من 0 إلى 100 يعبّر عن ثقتك في الصنف والموديل معاً"\n'
-        "}\n"
-        "القاعدة الأهم: الصنف هو ما تراه فعلاً في الصورة. "
-        "السماعة تبقى headset حتى لو كُتب على علبتها أنها تناسب جهاز ألعاب، "
-        "ولا تكتب console إلا إذا ظهر جهاز الألعاب نفسه. "
-        "لا تكتب موديلاً إلا إذا كان مكتوباً أو واضحاً في الصورة."
-    )
-
-    genai.configure(api_key=GEMINI_API_KEY)
-    model_names = list(GEMINI_MODELS)
-    tried_first_round = False
-    while True:
-        for model_name in model_names:
-            result = try_gemini_model(model_name, prompt, mime_type, image_response.content)
-            if result:
-                return result
-        if tried_first_round:
-            return None
-        tried_first_round = True
-        extra = [name for name in discover_gemini_models() if name not in model_names]
-        print("نماذج إضافية مكتشفة:", extra)
-        if not extra:
-            return None
-        model_names = extra
-
-
-def try_gemini_model(model_name, prompt, mime_type, image_bytes):
-    """يجرب نموذجاً واحداً ويعيد النص أو None."""
-    try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(
-            [prompt, {"mime_type": mime_type, "data": image_bytes}]
-        )
-        text = (response.text or "").strip()
-        if text:
-            print("نجح تحليل الصورة بالنموذج:", model_name)
-            return text
-        record_gemini_error(model_name + ": رد فارغ")
-    except Exception as error:
-        record_gemini_error(model_name + ": " + str(error))
-    return None
-
-
-def parse_vision_json(text):
-    """يحوّل رد Gemini إلى قاموس نظيف، أو None إن لم يكن JSON صالحاً."""
-    if not text:
-        return None
-    cleaned = re.sub(r"`{3}(?:json)?", "", text).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        data = json.loads(cleaned[start:end + 1])
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-
-    category = str(data.get("category", "other")).strip().lower()
-    if category not in VISION_CATEGORIES:
-        category = "other"
-    try:
-        confidence = int(float(data.get("confidence", 0)))
-    except (TypeError, ValueError):
-        confidence = 0
-
-    return {
-        "category": category,
-        "brand": str(data.get("brand", "غير واضح")).strip()[:60] or "غير واضح",
-        "model": str(data.get("model", "غير واضح")).strip()[:60] or "غير واضح",
-        "condition": str(data.get("condition", "غير واضح")).strip()[:40] or "غير واضح",
-        "damage": str(data.get("damage", "غير واضح")).strip()[:120] or "غير واضح",
-        "confidence": max(0, min(100, confidence)),
-    }
-
-
-def analyze_image_structured(image_url):
-    """يحلل الصورة ويعيد قاموساً منظماً (الصنف والموديل والحالة...) أو None."""
-    text = analyze_image_full_report(image_url)
-    if not text:
-        return None
-    data = parse_vision_json(text)
-    if data is None:
-        record_gemini_error("تعذر قراءة رد Gemini كـ JSON: " + text[:120])
-    return data
+from dh_core import *  # noqa: F401,F403
 
 
 # ============================================================
@@ -574,4 +222,230 @@ def assess_listing(listing, image_url):
         notes.append("تعذر تحليل الصورة")
     elif not valuation:
         decision = DECISION_UNKNOWN
-    elif valuati
+    elif valuation["profit"] < MIN_PROFIT:
+        decision = DECISION_SKIP
+    elif vision["confidence"] < MIN_VISION_CONFIDENCE:
+        decision = DECISION_REVIEW
+        notes.append("ثقة التعرف على الصورة منخفضة")
+    elif not is_damage_free(vision["damage"]):
+        decision = DECISION_REVIEW
+        notes.append("تلف ظاهر أو غير واضح في الصورة")
+    else:
+        decision = DECISION_BUY
+
+    return {"decision": decision, "vision": vision, "valuation": valuation, "notes": notes}
+
+
+def format_report(listing, result):
+    """يبني نص رسالة تيليجرام من نتيجة الفحص."""
+    vision = result["vision"]
+    valuation = result["valuation"]
+    lines = ["القرار: " + result["decision"], "", "العنوان: " + listing["title"]]
+
+    if vision:
+        lines.append("الصنف (من الصورة): " + VISION_CATEGORIES[vision["category"]])
+        lines.append("العلامة والموديل: " + vision["brand"] + " / " + vision["model"])
+        lines.append("الحالة: " + vision["condition"])
+        lines.append("التلف الظاهر: " + vision["damage"])
+        lines.append("درجة الثقة: " + str(vision["confidence"]) + "/100")
+    else:
+        lines.append("تحليل الصورة: غير متاح")
+
+    lines.append("")
+    price_text = str(listing["price"]) + "$" if listing["price"] else "غير مذكور"
+    lines.append("السعر المطلوب: " + price_text)
+    if SHIPPING_COST:
+        lines.append("الشحن: " + str(SHIPPING_COST) + "$ (تقدير ثابت)")
+    else:
+        lines.append("الشحن: غير محسوب (استلام شخصي)")
+
+    if valuation:
+        lines.append(
+            "القيمة السوقية: " + str(valuation["value"]) + "$ (وسيط "
+            + str(valuation["count"]) + " إعلانات مماثلة في المدينة نفسها؛ أسعار طلب وليست أسعار بيع)"
+        )
+        lines.append(
+            "الربح التقديري: " + str(valuation["profit"])
+            + "$ (القيمة السوقية ناقص السعر المطلوب"
+            + (" والرسوم والشحن" if (SELLING_FEE_RATE or SHIPPING_COST) else "") + ")"
+        )
+    else:
+        lines.append("القيمة السوقية: غير معروفة")
+        lines.append("الربح التقديري: لم يُحسب")
+
+    if result["notes"]:
+        lines.append("")
+        lines.append("ملاحظات:")
+        for note in result["notes"]:
+            lines.append("- " + note)
+
+    lines.append("")
+    lines.append(listing["link"])
+    return "\n".join(lines)
+
+
+def send_report(image_url, text):
+    """يرسل التقرير مع الصورة، وإن طال النص يرسله كاملاً في رسالة منفصلة."""
+    if not image_url:
+        return send_telegram_alert(text)
+    if len(text) <= 1000:
+        return send_telegram_photo(image_url, text) or send_telegram_alert(text)
+    short = "\n".join(text.split("\n")[:3])
+    photo_ok = send_telegram_photo(image_url, short)
+    text_ok = send_telegram_alert(text)
+    return photo_ok or text_ok
+
+
+# ============================================================
+# ذاكرة الصفقات المرسلة (لمنع تكرار التنبيه)
+# ============================================================
+
+def load_seen():
+    """يقرأ قائمة الروابط المرسلة سابقاً."""
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as file:
+            data = json.load(file)
+        if isinstance(data, list):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as error:
+        print("تعذر قراءة ملف الذاكرة:", error)
+    return []
+
+
+def save_seen(seen_list):
+    """يحفظ آخر الروابط المرسلة."""
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as file:
+            json.dump(seen_list[-MAX_SEEN:], file, ensure_ascii=False, indent=0)
+    except Exception as error:
+        print("تعذر حفظ ملف الذاكرة:", error)
+
+
+# ============================================================
+# التشغيل العادي
+# ============================================================
+
+def main():
+    print("=== بدء التشغيل العادي ===")
+    seen_links = set()
+    sent_list = load_seen()
+    sent_set = set(sent_list)
+    alerts_sent = 0
+
+    for term in SEARCH_TERMS:
+        for listing in search_listings(term):
+            link = listing["link"]
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+
+            # 1) فحص سريع على العنوان
+            part_key, reject_reason = prefilter_listing(listing)
+            if not part_key:
+                if reject_reason:
+                    print("تُجاهل:", listing["title"], "-", reject_reason)
+                continue
+
+            # 2) قيمة سوقية من إعلانات مماثلة، وإلا لا شيء
+            valuation = compute_valuation(listing, part_key)
+            if not valuation:
+                print("قيمة غير معروفة، تُتجاهل:", listing["title"])
+                continue
+            if valuation["profit"] < MIN_PROFIT:
+                continue
+
+            if link in sent_set:
+                print("أُرسلت هذه الصفقة سابقاً، تُتجاهل:", listing["title"])
+                continue
+
+            # 3) تحليل الصورة والتحقق من تطابق الصنف
+            print("مرشحة للفحص:", listing["title"], listing["price"])
+            image_url = get_listing_image(link)
+            result = assess_listing(listing, image_url)
+            print("القرار:", result["decision"], "|", result["notes"])
+            if result["decision"] not in (DECISION_BUY, DECISION_REVIEW):
+                continue
+
+            sent = send_report(image_url, format_report(listing, result))
+            if sent:
+                sent_list.append(link)
+                sent_set.add(link)
+                save_seen(sent_list)
+                alerts_sent += 1
+                if alerts_sent >= MAX_ALERTS_PER_RUN:
+                    print("تم بلوغ الحد الأقصى للتنبيهات.")
+                    return
+
+    save_seen(sent_list)
+    print("=== انتهى التشغيل العادي. عدد التنبيهات:", alerts_sent, "===")
+
+
+# ============================================================
+# وضع الاختبار
+# ============================================================
+
+# كل اختبار: (اسمه، كلمات البحث، هل يقبل أي إعلان بصورة إن لم يجد المطلوب)
+TEST_SCENARIOS = [
+    ("الاختبار 1: كرت شاشة", TEST_SEARCH_TERMS, True),
+    ("الاختبار 2: ملحق يحمل اسم PS5 (للتأكد من عدم الخلط)", TEST_ACCESSORY_TERMS, False),
+]
+
+
+def find_test_listing(terms, fallback_any):
+    """يختار إعلاناً حقيقياً بصورة، يفضّل من يحمل عنوانه اسم قطعة معروفة."""
+    for term in terms:
+        for listing in search_listings(term)[:15]:
+            if not match_known_part(listing["title"]):
+                continue
+            image_url = get_listing_image(listing["link"])
+            if image_url:
+                return listing, image_url
+
+    if fallback_any:
+        for term in SEARCH_TERMS:
+            for listing in search_listings(term)[:15]:
+                image_url = get_listing_image(listing["link"])
+                if image_url:
+                    return listing, image_url
+
+    return None, None
+
+
+def run_vision_test():
+    print("=== بدء الاختبار ===")
+
+    if not send_telegram_alert(
+        "بدأ الاختبار: سيصلك اختباران على إعلانات حقيقية. الأول كرت شاشة، "
+        "والثاني ملحق يحمل اسم PS5 للتأكد من عدم الخلط بينهما."
+    ):
+        print("فشل الإرسال لتيليجرام. تأكد من صحة توكن البوت.")
+        return
+
+    for name, terms, fallback_any in TEST_SCENARIOS:
+        listing, image_url = find_test_listing(terms, fallback_any)
+        if not listing:
+            print(name, ": لم يُعثر على إعلان مناسب")
+            send_telegram_alert(name + "\n\nلم يُعثر على إعلان مناسب الآن. أعد التشغيل لاحقاً.")
+            continue
+
+        print(name, "->", listing["title"])
+        result = assess_listing(listing, image_url)
+        text = name + "\n\n" + format_report(listing, result)
+        if not result["vision"] and GEMINI_ERRORS:
+            text += "\n\nأسباب فشل Gemini:\n" + "\n".join(GEMINI_ERRORS[-4:])
+        send_report(image_url, text)
+
+    print("=== انتهى الاختبار. تحقق من تيليجرام الآن ===")
+
+
+# ============================================================
+# نقطة البداية
+# ============================================================
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        run_vision_test()
+    else:
+        main()
